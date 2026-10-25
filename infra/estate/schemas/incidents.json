@@ -1,0 +1,62 @@
+[
+  {
+    "name": "incident_id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Stable incident key, e.g. INC-4471. Used as the row key in the fixture manifest."
+  },
+  {
+    "name": "service",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Service the incident was raised against. Joins to services.service."
+  },
+  {
+    "name": "owner_team",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Owning team. The row access policy predicate reads this column and nothing else."
+  },
+  {
+    "name": "severity",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "SEV1 through SEV4."
+  },
+  {
+    "name": "status",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "open, mitigated or closed."
+  },
+  {
+    "name": "opened_at",
+    "type": "TIMESTAMP",
+    "mode": "REQUIRED",
+    "description": "When the incident was raised."
+  },
+  {
+    "name": "resolved_at",
+    "type": "TIMESTAMP",
+    "mode": "NULLABLE",
+    "description": "Null while the incident is open."
+  },
+  {
+    "name": "title",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "One-line summary shown by search results."
+  },
+  {
+    "name": "summary",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Narrative description of the incident."
+  },
+  {
+    "name": "postmortem_summary",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Written after resolution. F1 is planted in this field on a team-b row (schemas.md §3)."
+  }
+]

@@ -1,0 +1,38 @@
+[
+  {
+    "name": "service",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Service name, unique. The join key for incidents, deploys and logs."
+  },
+  {
+    "name": "owner_team",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Owning team. Visible to every caller: the catalogue is deliberately unfiltered."
+  },
+  {
+    "name": "description",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "What the service does."
+  },
+  {
+    "name": "repository",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Source repository, as owner/name."
+  },
+  {
+    "name": "runtime",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Runtime the service is deployed on."
+  },
+  {
+    "name": "tier",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Criticality tier, tier-1 through tier-3."
+  }
+]

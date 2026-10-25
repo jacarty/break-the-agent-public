@@ -1,0 +1,62 @@
+name: Feature Request
+description: Propose an addition, and show which matrix cell it changes
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This project has a deliberately narrow scope. Per the scope gate in
+        `docs/prd.md` §11, an addition qualifies **only if it changes what the
+        result matrix can demonstrate** — a new row or column answering a
+        question the matrix currently cannot.
+
+        Interest is not a qualification. A fourth model does not qualify. A
+        third agent does not qualify. This is not a reflection on the idea.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What question can the matrix not currently answer?
+      placeholder: The matrix shows whether a control holds, but not...
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed addition
+      description: What would you add?
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope_gate
+    attributes:
+      label: Which matrix cell does this change?
+      description: >
+        Name the row or column this creates or alters, and the question it lets
+        the matrix answer that it cannot today. If the honest answer is "none,
+        but it would be interesting", say so — that is a legitimate answer and a
+        clear one, and it saves everyone the discussion.
+    validations:
+      required: true
+
+  - type: textarea
+    id: coverage
+    attributes:
+      label: OWASP coverage (if relevant)
+      description: >
+        If this exercises a category currently listed as not covered in
+        `docs/overview.md`, name it. Several are uncovered because the estate
+        cannot exercise them — say how this changes that.
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Anything else — links, prior art, examples
+    validations:
+      required: false

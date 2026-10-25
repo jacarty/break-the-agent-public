@@ -1,0 +1,328 @@
+[project]
+name = "break-the-agent"
+version = "0.0.0"
+description = "A deliberately vulnerable AI agent lab you deploy into your own cloud project, then attack."
+requires-python = ">=3.13,<3.14"
+license = { file = "LICENSE" }
+
+# Runtime dependencies are added by the phase that needs them, not up front.
+#
+# `google-auth` and `google-cloud-bigquery` arrived with the phase 0 credential
+# spike and stayed: the generator's applier needs both. The other three are the
+# rest of the estate's surfaces, added in phase 1 for the same reason.
+#
+# All five are imported only by `bta.generator.apply`, never by the planner —
+# so the determinism tests run without any of them, which is the point of the
+# split described in `src/bta/generator/plan.py`.
+#
+# `requests` arrived with the phase 2 tool boundary. It was already present
+# transitively behind the Google clients, which is exactly why it is declared:
+# `bta.tools.clients` imports it directly for the L3 Firestore REST path, and a
+# direct import resting on somebody else's transitive dependency breaks the day
+# that dependency drops it.
+dependencies = [
+    "anthropic>=0.120.2",
+    "google-auth>=2.38",
+    "google-cloud-bigquery>=3.27",
+    "google-cloud-firestore>=2.19",
+    "google-cloud-secret-manager>=2.21",
+    "google-cloud-storage>=2.18",
+    "google-genai>=2.16.0",
+    "openai>=2.53.0",
+    "requests>=2.32",
+    # The site (phase 4). ADR 0007 chose server-rendered HTML with SSE and no
+    # client build step, so this is an ASGI server and a routing layer and
+    # nothing else — no templating engine, no ORM, no bundler. Starlette's
+    # `EventSourceResponse` shape is a plain async generator, which is what
+    # keeps the streaming path readable in a repository meant to be read
+    # (DIS-1).
+    #
+    # Both are resolved under the fixed `exclude-newer` cutoff below rather
+    # than at their newest: starlette 1.6.0 and uvicorn 0.52.4 both postdate
+    # it. The cutoff is a deliberate, reviewable control and moving it to admit
+    # a dependency this phase happens to want is exactly the drive-by it exists
+    # to prevent — so these are pinned under it instead.
+    "starlette>=1.3.1",
+    "uvicorn>=0.52.1",
+    # The attack suite (phase 5). The runner drives a live deployment over the
+    # same HTTP surface an attacker uses, with per-provider concurrency, so it
+    # needs an async client — `requests` above is synchronous and is declared
+    # for the tool boundary's Firestore REST path.
+    #
+    # Already present transitively behind `anthropic` and `openai`, and
+    # declared for exactly the reason `requests` is: a direct import resting on
+    # somebody else's transitive dependency breaks the day that dependency
+    # drops it. The floor is the version already resolved under the cutoff
+    # below, so this adds a name to the manifest and changes no resolution.
+    "httpx>=0.28.1",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.9",
+    "pytest>=8.3",
+    "import-linter>=2.3",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# `verifier/` is a second top-level tree by design (VER-3) and is added here
+# when it exists. Listing packages explicitly rather than letting the backend
+# guess is what keeps that separation visible in the build config too.
+#
+# `suite/` is a third, added in phase 5, and it ships: FR-20 requires the suite
+# to be in the repository and to run against the deployer's own deployment, so
+# an install that omitted it would omit half of what SC-6 asks a deployer to
+# reproduce. It carries the case JSON alongside the modules, which is why the
+# package is listed rather than the modules being collected.
+packages = ["src/bta", "verifier", "suite"]
+
+[tool.uv]
+# Installed into the environment as of phase 1, one commit earlier than the
+# note here previously predicted: the generator is the first code with a
+# consumer, and `python -m bta.generator` needs it importable.
+package = true
+
+# No dependency version published within 7 days of this date is resolvable.
+# A freshly published version is the window in which a compromised or broken
+# release is most likely to still be live; a short quarantine removes that
+# exposure at no cost.
+#
+# Fixed, not rolling. Bumping it is a deliberate, reviewable act — the same
+# reasoning that governs the pre-registered artefacts in build-plan.md §4, and
+# what keeps a deployer's resolution identical to the reference run's.
+exclude-newer = "2026-08-05T00:00:00Z"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+# build-plan.md §5. Its other four import contracts cover packages that arrive
+# in phases 2–4; `tests/test_structure.py` fails if one lands without its
+# contract.
+
+[tool.importlinter]
+root_packages = ["bta", "verifier", "suite"]
+# `verifier` joins as a root package in the commit that creates the tree.
+# Until it did, import-linter treated it as an external package and only
+# `bta.screener -> verifier` was expressible; the reverse direction VER-3
+# actually turns on could not be written down at all.
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "The generator's planning half touches no cloud"
+type = "forbidden"
+source_modules = ["bta.generator"]
+forbidden_modules = ["google"]
+# Applier only. This is what lets the determinism suite run with no project,
+# no credentials and no network. Scoped to the package, not a module list, so
+# a new module inherits the rule.
+ignore_imports = ["bta.generator.apply -> google"]
+
+[[tool.importlinter.contracts]]
+name = "Tools import no agent framework and cannot reach flag values"
+type = "forbidden"
+source_modules = ["bta.tools"]
+forbidden_modules = ["bta.generator", "bta.agent", "bta.levels"]
+# POR-3, FR-11 — tools are plain functions and the framework wraps them. The
+# `bta.agent` half of that rule is added by the commit that creates the package;
+# `tests/test_structure.py` fails if one lands without the other, and a
+# forbidden module that does not exist yet is not something import-linter can
+# check.
+#
+# `bta.generator` is the second half and is due now. The generator holds the
+# estate plan and the fixture manifest, both of which carry live flag values,
+# and `schemas.md` §3 says no tool may reach the manifest. One import is all it
+# would take, and it would look like reuse.
+#
+# `bta.agent` is the rule §5 actually names, and it becomes checkable in phase
+# 3 with the package that arrives to be forbidden. `bta.levels` is here for the
+# same reason without being named there: it holds the composed prompts and the
+# L2 mitigation stack, so a tool importing it would be a tool that knows what
+# level it is running at — and FR-13's claim is that the tool bodies do not.
+
+[[tool.importlinter.contracts]]
+name = "The screener and the verifier share no code, in either direction"
+type = "forbidden"
+source_modules = ["bta.screener"]
+forbidden_modules = ["verifier", "bta.generator"]
+# VER-3. They are the same mechanism pointed in opposite directions: the
+# verifier holds live flag values and looks for them, the screener matches a
+# pattern class and has never been told a flag exists. FR-16 is what a shared
+# regex module would quietly end.
+#
+# **Both halves are expressible as of phase 4.** This contract is the
+# `bta.screener -> verifier` direction; the contract below is the reverse, and
+# neither is sufficient alone. `tests/test_structure.py` requires each of the
+# two trees to appear as a *source module* of one contract and a *forbidden
+# module* of another, so a single one-way rule no longer reads as satisfying
+# VER-3.
+#
+# `bta.generator` is forbidden for the same reason it is forbidden to
+# `bta.tools`: it holds live flag values, and a screener that could reach one
+# is a screener that could learn flag syntax by accident.
+
+[[tool.importlinter.contracts]]
+name = "The verifier shares no code with the screener, and holds the flag values"
+type = "forbidden"
+source_modules = ["verifier"]
+forbidden_modules = ["bta.screener", "bta.agent", "bta.tools", "bta.levels", "bta.site"]
+# VER-3's reverse direction, and the one that was inexpressible until this tree
+# became a root package.
+#
+# `bta.screener` is the rule VER-3 names. The other three are this phase's own
+# and rest on a different argument: the verifier consumes serialised artefacts
+# — a transcript dict, an audit record dict, the fixture manifest — and never
+# the runtime that produced them. That is what lets it re-score a run captured
+# months earlier, and what stops the redactor growing a dependency on the shape
+# of the loop it redacts. `bta.generator` is deliberately absent: the manifest
+# is the documented contract between the two (`schemas.md` §3) and the verifier
+# is the one component permitted to read it.
+
+[[tool.importlinter.contracts]]
+name = "The site reaches flag values only through the verifier"
+type = "forbidden"
+source_modules = ["bta.site"]
+forbidden_modules = ["bta.generator", "bta.screener"]
+allow_indirect_imports = true
+# `schemas.md` §3 permits one component to hold live flag values. FR-6 requires
+# captures to happen automatically in the session, so the site process
+# necessarily *contains* the verifier — but it must reach values through it and
+# never independently.
+#
+# `bta.generator` is forbidden because it holds the estate plan and writes the
+# fixture manifest: a site that imported it could mint or read values without
+# the verifier being involved, and `verifier.manifest` would stop being the
+# single reader §3 says it is.
+#
+# `bta.screener` is forbidden for the FR-16 reason rather than a containment
+# one. The site renders model output; a route that reached for the screener to
+# "tidy" what it displays would be running an L2 mitigation at L1 and L3, and
+# the level column would stop measuring the level.
+#
+# `allow_indirect_imports` because the site imports `bta.agent`, which reaches
+# `bta.screener` through `bta.levels.mitigations` — that is the L2 stack doing
+# its job and is exactly the path FR-15 requires. The rule this contract
+# expresses is about the site reaching for either package *itself*.
+
+[[tool.importlinter.contracts]]
+name = "The agent loop reaches tools only through the audited boundary"
+type = "forbidden"
+source_modules = ["bta.agent"]
+forbidden_modules = ["bta.generator", "bta.credentials"]
+allow_indirect_imports = true
+# Two rules in one contract, both about what the loop must not be able to do.
+#
+# `bta.generator` — the loop must not reach flag values. It renders C1's marker
+# into tool descriptions from a value handed to it (TD-13, ADR 0003); going and
+# finding one would make the loop a second reader of the manifest.
+#
+# `bta.credentials` — the loop must not mint. It builds a `ToolContext`
+# and calls `boundary.invoke`; which credential that resolves to is the policy
+# table's decision, made from the level. A loop that could construct a
+# credential directly is a loop where a future edit could select one, and
+# credential selection is the experiment's independent variable.
+#
+# The **package** is forbidden, not `bta.credentials.factory`. Forbidding the
+# module let `from bta.credentials import CredentialFactory` through, because
+# `bta/credentials/__init__.py` re-exports it and that import names the package.
+# The narrower form was chosen to accommodate one legitimate import of
+# `CredentialPolicyViolation` in `loop.py`; that import has been removed
+# instead, so the contract can be the strict one.
+
+[[tool.importlinter.contracts]]
+name = "Credential minting does not depend on the tool boundary"
+type = "forbidden"
+source_modules = ["bta.credentials"]
+forbidden_modules = ["bta.tools"]
+# Authority flows one way. The boundary asks for a credential; a credential
+# never asks anything of the boundary. Without this the two grow a cycle
+# through a shared helper, and `policy.py` stops being readable on its own —
+# which matters more here than usual, because that table is the experiment's
+# independent variable.
+
+[[tool.importlinter.contracts]]
+name = "Caller authentication material is read only inside bta.identity"
+type = "forbidden"
+source_modules = ["bta.tools", "bta.credentials", "bta.audit", "bta.config", "bta.generator"]
+forbidden_modules = ["bta.identity.tokens"]
+allow_indirect_imports = true
+# Direct imports only. `CallerIdentity` is re-exported by `bta.identity`, so
+# every legitimate consumer reaches the module indirectly by definition; what
+# this forbids is a second module importing it *directly*, which is what a
+# second reader of caller auth would have to do.
+#
+# POR-1 — one adapter, and nothing else reads a caller's token.
+#
+# The module rather than the package is forbidden on purpose: `CallerIdentity`
+# is meant to travel, and does, through `bta.identity`. What must not travel is
+# a second place that decides what team a caller is on. Spike 0.1 finding 3 is
+# why: IAM grants on `attribute.team`, so whatever picks that claim is the root
+# of trust for the whole L3 column, and a second one would not be caught by any
+# binding in the estate.
+
+[[tool.importlinter.contracts]]
+# Phase 5's own, and not one of build-plan.md §5's seven.
+#
+# `schemas.md` §3 keeps the set of components that may read live flag values to
+# two: the generator that plants them and the verifier that detects them. The
+# suite is neither, and it does not need to be — capture happens inside the
+# site process (FR-6), which already contains the verifier, and the suite is
+# told *that* a flag came out, with its id, channel and matching normalisation
+# and never its value.
+#
+# Left unconstrained, the obvious convenience is for the runner to import the
+# verifier and re-scan a transcript itself. That would put live values in the
+# suite's process and in anything it writes, and run results are committed
+# artefacts (SC-6) while raw transcripts deliberately are not (VER-6).
+name = "The suite is told about captures and never holds a flag value"
+type = "forbidden"
+source_modules = ["suite"]
+forbidden_modules = ["bta.generator", "verifier"]
+
+[[tool.importlinter.contracts]]
+# The matrix is pure aggregation over serialised run results (schemas.md §8).
+#
+# SC-6 asks a deployer to rebuild the matrix from a run's results and obtain
+# the same document. A builder that could reach the runner could reach a live
+# deployment, and its output would then depend on something other than its
+# input. `bta` is forbidden for the same reason rather than a different one:
+# the matrix reads JSON, not the runtime that produced it.
+name = "The matrix aggregates results and cannot reach a deployment"
+type = "forbidden"
+source_modules = ["suite.matrix"]
+forbidden_modules = ["suite.runner", "suite.cases", "bta"]
+
+[[tool.importlinter.contracts]]
+# Added 2026-08-29 with the persistent memory store (TD-17), and not one of
+# build-plan.md §5's seven.
+#
+# `bta.memory.firestore` reaches Firestore through the REST API with the
+# caller's own token, which is the same transport `bta.tools.clients` uses for
+# the L3 document path — so the convenient move is to import its
+# `HttpTransport` and its private value decoder rather than carry a second
+# copy. That convenience is what this forbids, for two reasons.
+#
+# The tool path splits by level: a server SDK at L1 and L2, REST at L3. Memory
+# does not split, because `firestore.rules` says per-persona "at every level"
+# and a server client is not subject to rules at all. Sharing the transport
+# invites sharing the dispatch, and a memory store that acquired a level would
+# put F7b's containment claim back inside our own code.
+#
+# The second is plainer: memory is written by the agent loop, and the loop
+# already reaches tools only through the audited boundary. A path from the
+# memory store into the tool tree would be a second way in.
+name = "The memory store does not depend on the tool boundary"
+type = "forbidden"
+source_modules = ["bta.memory"]
+forbidden_modules = ["bta.tools", "bta.agent", "bta.generator"]

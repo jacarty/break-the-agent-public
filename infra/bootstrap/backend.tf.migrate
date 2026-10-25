@@ -1,0 +1,14 @@
+# Not a .tf file, and deliberately so: Terraform must not see a backend block on
+# the first apply, because the bucket it names does not exist yet. Do not
+# "correct" the extension.
+#
+# Copy this to backend.tf as step 2 of the bootstrap, then run
+# `terraform init -migrate-state -backend-config=...`. Every later run from a
+# fresh clone needs the same copy plus a plain `terraform init`. See README.md.
+#
+# Configuration is supplied entirely at init time, so no bucket name is
+# committed to the repository (POR-6).
+
+terraform {
+  backend "gcs" {}
+}

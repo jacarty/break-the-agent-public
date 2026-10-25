@@ -1,0 +1,44 @@
+[
+  {
+    "name": "insert_id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Unique entry key. Named after Cloud Logging's insertId so the table reads as a log export."
+  },
+  {
+    "name": "timestamp",
+    "type": "TIMESTAMP",
+    "mode": "REQUIRED",
+    "description": "Entry time. Partition column."
+  },
+  {
+    "name": "severity",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "DEBUG through CRITICAL."
+  },
+  {
+    "name": "log_name",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Logical log the entry belongs to, e.g. projects/<id>/logs/checkout-api."
+  },
+  {
+    "name": "service",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Service that emitted the entry. Joins to services.service."
+  },
+  {
+    "name": "text_payload",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "The log line itself. F3's injection is planted here, in a line any caller may read — the line is the carrier, not the flag."
+  },
+  {
+    "name": "trace",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Trace identifier, where one was propagated."
+  }
+]

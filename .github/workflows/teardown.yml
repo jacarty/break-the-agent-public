@@ -1,0 +1,223 @@
+# NFR-6: `terraform destroy` removes every provisioned resource. Verified, not
+# assumed.
+#
+# Terraform does the destroying. The step after it scans the project for what
+# Terraform could not have known about — see scripts/README.md — and writes a
+# log that is uploaded whether the check passes or fails.
+
+name: teardown
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Which half to run
+        required: true
+        default: destroy-and-verify
+        type: choice
+        options:
+          - capture-baseline
+          - destroy-and-verify
+
+concurrency:
+  group: teardown-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  teardown:
+    runs-on: ubuntu-latest
+    environment: lab
+    env:
+      PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      LOG: evidence/teardown/teardown-${{ github.run_id }}.log
+      TF_VAR_project_id: ${{ vars.GCP_PROJECT_ID }}
+      TF_VAR_project_number: ${{ vars.GCP_PROJECT_NUMBER }}
+      TF_VAR_arena_pool_id: ${{ vars.GCP_ARENA_POOL_ID }}
+      TF_VAR_region: ${{ vars.GCP_REGION }}
+      TF_VAR_bigquery_location: ${{ vars.GCP_BIGQUERY_LOCATION }}
+      TF_VAR_artefact_bucket_name: ${{ vars.GCP_ARTEFACT_BUCKET_NAME }}
+      TF_VAR_artefact_bucket_location: ${{ vars.GCP_ARTEFACT_BUCKET_LOCATION }}
+      TF_VAR_firestore_location: ${{ vars.GCP_FIRESTORE_LOCATION }}
+      # infra/billing-guard is destroyed too. A destroy still evaluates
+      # variables, so these have to be present even though nothing reads them.
+      TF_VAR_billing_account_id: ${{ secrets.GCP_BILLING_ACCOUNT_ID }}
+      TF_VAR_budget_amount: ${{ vars.GCP_BUDGET_AMOUNT }}
+      TF_VAR_currency_code: ${{ vars.GCP_CURRENCY_CODE }}
+      TF_VAR_source_bucket_name: ${{ vars.GCP_GUARD_SOURCE_BUCKET }}
+      TF_VAR_enable_kill_switch: ${{ vars.GCP_ENABLE_KILL_SWITCH || 'false' }}
+
+      # infra/hosting is destroyed too, and its twenty-six required variables
+      # are evaluated for a destroy exactly as billing-guard's are.
+      #
+      # **Placeholders, deliberately — and this teardown never reads a flag
+      # value.** A destroy plans deletions from state; it does not need a
+      # variable to match what was applied, because the attributes it deletes
+      # come from state rather than from configuration. The two that must be
+      # real are the ones the provider itself is configured with, project and
+      # region, and they are above. Everything else is shaped to satisfy
+      # validation and nothing more — `image` has to look digest-pinned,
+      # `site_provider` has to be one of the three.
+      #
+      # The alternative was reading the fixture manifest into this job to pass
+      # real markers. That would put every live flag value on a runner in order
+      # to delete resources whose values Terraform already holds, which is the
+      # wrong trade: schemas.md §3 keeps that set small on purpose.
+      TF_VAR_arena_provider_id: ${{ vars.GCP_ARENA_PROVIDER_ID }}
+      TF_VAR_registry_id: placeholder
+      TF_VAR_image: placeholder@sha256:0000000000000000000000000000000000000000000000000000000000000000
+      TF_VAR_site_provider: anthropic
+      TF_VAR_model_anthropic: placeholder
+      TF_VAR_model_google: placeholder
+      TF_VAR_model_xai: placeholder
+      TF_VAR_vertex_location: placeholder
+      TF_VAR_estate_dataset_id: placeholder
+      TF_VAR_estate_ops_dataset_id: placeholder
+      TF_VAR_firestore_database_id: placeholder
+      TF_VAR_integration_secret_id: placeholder
+      TF_VAR_runtime_service_account_email: placeholder@example.invalid
+      TF_VAR_shared_service_account_email: placeholder@example.invalid
+      TF_VAR_provisioning_service_account_email: placeholder@example.invalid
+      TF_VAR_access_code: placeholder
+      TF_VAR_suite_bypass_token: placeholder
+      TF_VAR_fixture_manifest: "{}"
+      TF_VAR_marker_c1: placeholder
+      TF_VAR_marker_f6: placeholder
+      TF_VAR_marker_f4: placeholder
+      TF_VAR_identity_platform_api_key: placeholder
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same identity that applied it (TD-5). Destroying the estate removes the
+      # service accounts and IAM bindings it created, which needs the roles the
+      # federated principal is refused.
+      - uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_CI_DEPLOY_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.15.8
+          terraform_wrapper: false
+
+      # ── capture-baseline ──────────────────────────────────────────────────
+      # Must run before the estate is first applied, and cannot be
+      # reconstructed afterwards. A mode here rather than a documented manual
+      # step, because the step most likely to be skipped is the one that has to
+      # happen first.
+      - name: Capture the pre-estate baseline
+        if: inputs.mode == 'capture-baseline'
+        run: |
+          mkdir -p evidence/teardown
+          ./scripts/verify-teardown.sh capture \
+            --project-id "$PROJECT_ID" \
+            --out evidence/teardown/baseline.json
+          echo "Keep evidence/teardown/baseline.json private. Actions teardown requires it in a private deployment checkout." >> "$GITHUB_STEP_SUMMARY"
+
+      # ── destroy-and-verify ────────────────────────────────────────────────
+      - name: Inventory the estate before destroying it
+        if: inputs.mode == 'destroy-and-verify'
+        run: |
+          ./scripts/verify-teardown.sh capture \
+            --project-id "$PROJECT_ID" --out "$RUNNER_TEMP/before.json"
+
+      - name: terraform destroy
+        id: destroy
+        if: inputs.mode == 'destroy-and-verify'
+        run: |
+          # Hosting first, and this was missing until the site actually
+          # existed: NFR-6 covers every provisioned resource, the Cloud Run
+          # service is one, and leaving it up means it keeps billing while the
+          # check reports its resources as live orphans — a real failure that
+          # looks like a broken destroy rather than an incomplete one.
+          #
+          # Before the estate, because the site reads the estate: tearing the
+          # data out from under a running revision leaves it serving errors for
+          # as long as it takes the next step to finish.
+          #
+          # `-refresh=false` is deliberately not used. A destroy that skipped
+          # refresh would delete from stale state and report success over
+          # resources it never saw.
+          terraform -chdir=infra/hosting init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+          terraform -chdir=infra/hosting destroy -input=false -auto-approve
+
+          terraform -chdir=infra/estate init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+          terraform -chdir=infra/estate destroy -input=false -auto-approve
+
+          # After the estate, not before. NFR-6 covers every provisioned
+          # resource and the guard is one, but removing the cap while the thing
+          # it caps is still running is the wrong order to fail in.
+          terraform -chdir=infra/billing-guard init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+          terraform -chdir=infra/billing-guard destroy -input=false -auto-approve
+
+      # Runs whether the destroy succeeded or failed — a destroy that stopped
+      # part-way is when knowing what survived is worth most — but not when it
+      # never ran at all. A step never reached has outcome '', not 'skipped'.
+      - name: Check the project for stale resources
+        if: always() && contains(fromJSON('["success", "failure"]'), steps.destroy.outcome)
+        run: |
+          mkdir -p evidence/teardown
+
+          # Provenance, first line of the evidence. Impersonation is normally
+          # bound to one ref (TD-2); `ci_additional_privileged_refs` can widen
+          # that to test a workflow without merging it. A verification produced
+          # from unreviewed code is still a verification, but it must not be
+          # mistakable later for one produced from the privileged ref.
+          {
+            echo "run ${{ github.run_id }} — ref ${{ github.ref }} — sha ${{ github.sha }}"
+            if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+              echo "NOTE: dispatched from a non-default ref. This ref holds deploy" \
+                   "authority via ci_additional_privileged_refs (TD-2), and the code" \
+                   "that produced this result was not reviewed on main."
+            fi
+          } | tee -a "$LOG"
+
+          baseline=evidence/teardown/baseline.json
+          if [ ! -f "$baseline" ]; then
+            echo "No committed baseline. Every resource in the project is in scope," \
+                 "including bootstrap's, which survives by design (TD-1)." | tee -a "$LOG"
+            baseline=/dev/null
+          fi
+          set -o pipefail
+          # Deletion is not synchronous with the API call that requests it.
+          # The first real teardown reported a Cloud Function as an orphan that
+          # was gone a minute later: `terraform destroy` returned, the check ran
+          # immediately, and the function was still draining. A verification
+          # that races eventual deletion produces exactly the failure it exists
+          # to detect, which is worse than being slow — an NFR-6 result nobody
+          # can trust either way.
+          #
+          # Fixed rather than retried, because a retry loop would also mask a
+          # resource that genuinely never goes.
+          sleep 60
+
+          ./scripts/verify-teardown.sh check \
+            --project-id "$PROJECT_ID" \
+            --before "$RUNNER_TEMP/before.json" \
+            --baseline "$baseline" \
+            --registry-repository "${{ vars.GCP_REGISTRY_REPOSITORY }}" \
+            --out evidence/teardown/result-${{ github.run_id }}.json 2>&1 | tee -a "$LOG"
+
+      - name: Summarise
+        if: always()
+        run: |
+          [ -f "$LOG" ] || exit 0
+          { echo '```'; cat "$LOG"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: teardown-evidence-${{ github.run_id }}
+          path: evidence/teardown/
+          if-no-files-found: warn

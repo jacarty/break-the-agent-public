@@ -1,0 +1,446 @@
+# Gates on every PR. Estate apply and seed on manual dispatch, behind them.
+# Teardown is teardown.yml. The layer under both is infra/bootstrap, which has
+# no workflow and is applied from an operator's laptop — see TD-6.
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      apply_estate:
+        description: Apply and seed the estate after the gates pass
+        type: boolean
+        default: false
+      apply_hosting:
+        description: Apply infra/hosting after the estate. Requires `image`.
+        type: boolean
+        default: false
+      build_image:
+        description: >-
+          Build and push the image from this ref first, and deploy what it
+          produces. Leave off to deploy an existing digest via `image`.
+        type: boolean
+        default: true
+      image:
+        description: >-
+          Digest-pinned image for infra/hosting. Required when `build_image` is
+          off; ignored when it is on. A tag is refused — SC-6 commits the
+          reference run to reproducibility, and pinning an older digest
+          deliberately is how a reference run is reproduced.
+        type: string
+        default: ""
+      site_provider:
+        description: Which provider the interactive site calls.
+        type: choice
+        options: [anthropic, google, xai]
+        default: anthropic
+
+# Dispatch runs are never cancelled: interrupting a half-finished apply is how
+# state and project diverge.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - run: uv sync --frozen --all-groups
+
+      - name: ruff
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+
+      - name: Structural contracts (build-plan.md §5)
+        run: uv run lint-imports
+
+      - name: pytest
+        run: uv run pytest
+
+      - name: No flag values, no fixture manifest
+        run: |
+          if git ls-files -z | xargs -0 grep -lE 'BTA\{[A-Za-z0-9_-]{6,}\}' 2>/dev/null; then
+            echo "::error::Flag value in a tracked file. The estate needs reseeding."
+            exit 1
+          fi
+          if git ls-files | grep -E '(^|/)fixture-manifest.*\.json$'; then
+            echo "::error::Fixture manifest is tracked (schemas.md §3)."
+            exit 1
+          fi
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.15.8
+          terraform_wrapper: false
+
+      # -backend=false: validate needs no state, and this job holds no
+      # credential.
+      - name: terraform fmt and validate
+        run: |
+          terraform fmt -check -recursive infra/
+          failed=0
+          for dir in infra/*/; do
+            ls "$dir"*.tf >/dev/null 2>&1 || continue
+            echo "── $dir"
+            terraform -chdir="$dir" init -backend=false -input=false >/dev/null || failed=1
+            terraform -chdir="$dir" validate || failed=1
+          done
+          exit $failed
+
+  # Before the estate, always, and not as a separate dispatch: the cap has to
+  # exist before the thing it caps. Arming is `GCP_ENABLE_KILL_SWITCH`, a
+  # repository variable — the decision is data, so it survives as an audited
+  # settings change rather than as a manual apply somebody has to remember.
+  billing_guard:
+    needs: gates
+    if: github.event_name == 'workflow_dispatch' && inputs.apply_estate
+    runs-on: ubuntu-latest
+    environment: lab
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TF_VAR_project_id: ${{ vars.GCP_PROJECT_ID }}
+      TF_VAR_region: ${{ vars.GCP_REGION }}
+      TF_VAR_billing_account_id: ${{ secrets.GCP_BILLING_ACCOUNT_ID }}
+      TF_VAR_budget_amount: ${{ vars.GCP_BUDGET_AMOUNT }}
+      TF_VAR_currency_code: ${{ vars.GCP_CURRENCY_CODE }}
+      TF_VAR_source_bucket_name: ${{ vars.GCP_GUARD_SOURCE_BUCKET }}
+      # Defaults to false if the variable is unset. An unset variable must not
+      # be able to arm a kill switch.
+      TF_VAR_enable_kill_switch: ${{ vars.GCP_ENABLE_KILL_SWITCH || 'false' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_CI_DEPLOY_SERVICE_ACCOUNT }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.15.8
+          terraform_wrapper: false
+
+      - name: terraform apply
+        working-directory: infra/billing-guard
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+          terraform apply -input=false -auto-approve
+          echo "kill switch armed: $(terraform output -raw kill_switch_armed)" >> "$GITHUB_STEP_SUMMARY"
+
+  estate:
+    needs: [gates, billing_guard]
+    if: github.event_name == 'workflow_dispatch' && inputs.apply_estate
+    runs-on: ubuntu-latest
+    # The environment is a deployment record, not a control — it carries no
+    # protection rules. What gates this is the IAM binding: impersonating the
+    # deploy identity is conditioned on the ref (TD-2), so a dispatch from a
+    # branch fails at the token exchange.
+    environment: lab
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      TF_VAR_project_id: ${{ vars.GCP_PROJECT_ID }}
+      TF_VAR_project_number: ${{ vars.GCP_PROJECT_NUMBER }}
+      TF_VAR_arena_pool_id: ${{ vars.GCP_ARENA_POOL_ID }}
+      TF_VAR_region: ${{ vars.GCP_REGION }}
+      TF_VAR_bigquery_location: ${{ vars.GCP_BIGQUERY_LOCATION }}
+      TF_VAR_artefact_bucket_name: ${{ vars.GCP_ARTEFACT_BUCKET_NAME }}
+      TF_VAR_artefact_bucket_location: ${{ vars.GCP_ARTEFACT_BUCKET_LOCATION }}
+      TF_VAR_firestore_location: ${{ vars.GCP_FIRESTORE_LOCATION }}
+
+    steps:
+      - uses: actions/checkout@v4
+      # Impersonation, not a direct grant (TD-5). The estate declares service
+      # accounts and project IAM bindings; the roles that needs are the ones
+      # `ci_project_roles` refuses. They sit on this account instead, and the
+      # federated principal holds only tokenCreator on it. Still keyless — the
+      # token comes from STS and is short-lived (SEC-5, SEC-6).
+      - uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_CI_DEPLOY_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.15.8
+          terraform_wrapper: false
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: terraform apply
+        working-directory: infra/estate
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+          terraform apply -input=false -auto-approve
+
+      # NFR-5 is "clean to fully seeded", so the seed runs in the same job.
+      # --apply prunes each surface to the plan, so a reseed stops serving the
+      # previous seed's values rather than adding to them.
+      - name: Seed the estate
+        env:
+          ESTATE_SEED: ${{ secrets.ESTATE_SEED }}
+        run: |
+          uv sync --frozen
+          cd infra/estate
+          dataset=$(terraform output -raw dataset_id)
+          bucket=$(terraform output -raw artefact_bucket_name)
+          secret=$(terraform output -raw integration_secret_id)
+          database=$(terraform output -raw firestore_database_id)
+          cd - >/dev/null
+          uv run python -m bta.generator --apply \
+            --seed "$ESTATE_SEED" \
+            --project-id "$PROJECT_ID" \
+            --dataset-id "$dataset" \
+            --bucket "$bucket" \
+            --secret-id "$secret" \
+            --firestore-database "$database"
+
+      # .fixtures/ holds live flag values (schemas.md §3). It goes to the state
+      # bucket, never to an artifact, a log or the repository. `always()` so a
+      # failed seed does not leave the file on the runner.
+      - name: Store the fixture manifest
+        if: always()
+        run: |
+          if [ -f .fixtures/fixture-manifest.json ]; then
+            gcloud storage cp .fixtures/fixture-manifest.json \
+              "gs://${{ vars.TF_STATE_BUCKET }}/fixtures/fixture-manifest.json"
+          fi
+          rm -rf .fixtures
+
+  # ── hosting ───────────────────────────────────────────────────────────────
+  #
+  # NFR-5 wants clean-to-deployed with no manual intervention beyond bootstrap,
+  # and SC-6 wants the reference run reproducible. A site that only ever
+  # deployed from one laptop with twenty-five exported variables satisfied
+  # neither — and the first hand-run apply found four defects, each costing a
+  # merge, an image build and a re-apply performed in the right order.
+  #
+  # **Flag values never leave the runner and never enter a log.** The seed step
+  # above already writes the manifest to the state bucket; this reads it back,
+  # masks every value in it before Terraform can quote one in an error, and
+  # deletes it in an `always()` step. Nothing new is stored anywhere: the seed
+  # is already a repository secret and the manifest is derived from it, so this
+  # is strictly less exposure than a person copying the file to a laptop.
+  # Calls `image.yml` rather than repeating it. Gated on `build_image` so a
+  # reference run can be reproduced against the digest it actually used
+  # (SC-6) instead of whatever HEAD builds today.
+  image:
+    needs: [gates]
+    if: github.event_name == 'workflow_dispatch' && inputs.apply_hosting && inputs.build_image
+    uses: ./.github/workflows/image.yml
+    permissions:
+      contents: read
+      id-token: write
+    secrets: inherit
+
+  hosting:
+    needs: [gates, estate, image]
+    # `image` and `estate` are both skippable, and a skipped dependency is not
+    # a failed one. `!cancelled()` with explicit result checks is the form that
+    # distinguishes them — a bare `needs` would skip hosting whenever either
+    # was not run, which is the common case for a redeploy.
+    if: >-
+      !cancelled()
+      && github.event_name == 'workflow_dispatch'
+      && inputs.apply_hosting
+      && (needs.estate.result == 'success' || needs.estate.result == 'skipped')
+      && (needs.image.result == 'success' || needs.image.result == 'skipped')
+    runs-on: ubuntu-latest
+    environment: hosting
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TF_VAR_project_id: ${{ vars.GCP_PROJECT_ID }}
+      TF_VAR_project_number: ${{ vars.GCP_PROJECT_NUMBER }}
+      TF_VAR_region: ${{ vars.GCP_REGION }}
+      TF_VAR_arena_pool_id: ${{ vars.GCP_ARENA_POOL_ID }}
+      TF_VAR_arena_provider_id: ${{ vars.GCP_ARENA_PROVIDER_ID }}
+      # What the build just produced, or the digest pinned on the dispatch —
+      # never both, and never a value typed twice.
+      TF_VAR_image: ${{ needs.image.outputs.image || inputs.image }}
+      TF_VAR_site_provider: ${{ inputs.site_provider }}
+      TF_VAR_model_anthropic: ${{ vars.BTA_MODEL_ANTHROPIC }}
+      TF_VAR_model_google: ${{ vars.BTA_MODEL_GOOGLE }}
+      TF_VAR_model_xai: ${{ vars.BTA_MODEL_XAI }}
+      TF_VAR_vertex_location: ${{ vars.BTA_VERTEX_LOCATION }}
+      TF_VAR_anthropic_vertex_location: ${{ vars.BTA_ANTHROPIC_VERTEX_LOCATION }}
+      TF_VAR_xai_vertex_location: ${{ vars.BTA_XAI_VERTEX_LOCATION }}
+      TF_VAR_min_instance_count: ${{ vars.BTA_MIN_INSTANCE_COUNT || '1' }}
+      TF_VAR_cpu_idle: ${{ vars.BTA_CPU_IDLE || 'false' }}
+      TF_VAR_daily_token_ceiling: ${{ vars.BTA_DAILY_TOKEN_CEILING || '2000000' }}
+      TF_VAR_evidence_bucket_name: ${{ vars.GCP_EVIDENCE_BUCKET_NAME || format('{0}-evidence', vars.GCP_PROJECT_ID) }}
+      TF_VAR_evidence_bucket_location: ${{ vars.GCP_EVIDENCE_BUCKET_LOCATION || vars.GCP_ARTEFACT_BUCKET_LOCATION }}
+      TF_VAR_access_code: ${{ secrets.BTA_ACCESS_CODE }}
+      TF_VAR_suite_bypass_token: ${{ secrets.BTA_SUITE_BYPASS_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_CI_DEPLOY_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.15.8
+          terraform_wrapper: false
+
+      # The module refuses a tag too, but only at plan time, after an init that
+      # costs a minute. Refusing here says why in one line.
+      - name: Check the image is digest-pinned
+        env:
+          IMAGE: ${{ needs.image.outputs.image || inputs.image }}
+        run: |
+          case "$IMAGE" in
+            "")
+              echo "no image: either set build_image, or pass a digest in image" >&2
+              exit 1 ;;
+            *@sha256:*) echo "deploying $IMAGE" ;;
+            *) echo "image must be digest-pinned, not a tag (SC-6)" >&2; exit 1 ;;
+          esac
+
+      # registry_id is the bare repository id — the last segment of bootstrap's
+      # registry_repository output, not the whole push target. Passing the whole
+      # value builds an Artifact Registry resource id containing a hostname, and
+      # the apply fails on a resource that reads as correctly configured.
+      - name: Resolve estate outputs and the registry id
+        env:
+          REGISTRY_REPOSITORY: ${{ vars.GCP_REGISTRY_REPOSITORY }}
+          STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+        run: |
+          set -euo pipefail
+          terraform -chdir=infra/estate init -input=false \
+            -backend-config="bucket=$STATE_BUCKET" >/dev/null
+          terraform -chdir=infra/estate output -json > estate.json
+          for pair in \
+            "estate_dataset_id:dataset_id" \
+            "estate_ops_dataset_id:ops_dataset_id" \
+            "artefact_bucket_name:artefact_bucket_name" \
+            "firestore_database_id:firestore_database_id" \
+            "integration_secret_id:integration_secret_id" \
+            "runtime_service_account_email:runtime_service_account_email" \
+            "shared_service_account_email:shared_service_account_email" \
+            "provisioning_service_account_email:provisioning_service_account_email"
+          do
+            name="${pair%%:*}"
+            key="${pair##*:}"
+            value=$(jq -r --arg k "$key" '.[$k].value' estate.json)
+            echo "TF_VAR_${name}=${value}" >> "$GITHUB_ENV"
+          done
+          rm -f estate.json
+          echo "TF_VAR_registry_id=${REGISTRY_REPOSITORY##*/}" >> "$GITHUB_ENV"
+
+      # The Identity Platform browser key lives in infra/bootstrap, because a
+      # destroy locks its id for 30 days and hosting is destroyed every cycle
+      # (infra/bootstrap/identity_platform_key.tf). So it is read here rather
+      # than created by the apply.
+      #
+      # `backend.tf` is gitignored — the bucket it names is a deployment value
+      # — so a fresh checkout has no backend and `terraform output` would
+      # silently return nothing from empty local state. Copying the committed
+      # `backend.tf.migrate` is the same step first-deploy.md gives an
+      # operator, and the empty check below is why it cannot be skipped
+      # quietly: a blank key applies cleanly and breaks the persona picker at
+      # runtime, which is a long way from here.
+      #
+      # This reads state; it does not refresh it. TD-6 keeps CI out of
+      # bootstrap's *apply* path, and `terraform output` is not that.
+      - name: Resolve the Identity Platform browser key
+        env:
+          STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+        run: |
+          set -euo pipefail
+          cp infra/bootstrap/backend.tf.migrate infra/bootstrap/backend.tf
+          # **The prefix is not optional here.** `backend.tf.migrate` is a
+          # bare `backend "gcs" {}` — unlike infra/estate, which commits
+          # `prefix = "estate"` in the block — so bucket-only inits against the
+          # bucket root, finds empty state, and the guard below then tells the
+          # operator to apply a module that is already applied.
+          terraform -chdir=infra/bootstrap init -input=false \
+            -backend-config="bucket=$STATE_BUCKET" \
+            -backend-config="prefix=bootstrap" >/dev/null
+          # `|| true` so a missing output reaches the message below rather
+          # than dying on `set -e` with terraform's own wording.
+          key=$(terraform -chdir=infra/bootstrap output \
+            -raw identity_platform_api_key 2>/dev/null || true)
+          if [ -z "$key" ]; then
+            echo "bootstrap has no identity_platform_api_key output." >&2
+            echo "Apply infra/bootstrap before deploying the site." >&2
+            exit 1
+          fi
+          # Public by design (SEC-10), masked anyway: a key-shaped string in a
+          # build log teaches the wrong habit even when this one costs nothing.
+          echo "::add-mask::$key"
+          echo "TF_VAR_identity_platform_api_key=${key}" >> "$GITHUB_ENV"
+
+      # Masked before anything can quote one. schemas.md §3 keeps the set of
+      # components that see live flag values small; this hands them to
+      # Terraform, which is why the masking is explicit rather than assumed.
+      - name: Read the fixture manifest
+        env:
+          STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+        run: |
+          set -euo pipefail
+          gcloud storage cp \
+            "gs://$STATE_BUCKET/fixtures/fixture-manifest.json" manifest.json
+          while read -r value; do
+            echo "::add-mask::$value"
+          done < <(jq -r '.flags[].value' manifest.json)
+          {
+            echo "TF_VAR_fixture_manifest<<MANIFEST_EOF"
+            cat manifest.json
+            echo "MANIFEST_EOF"
+          } >> "$GITHUB_ENV"
+          for flag in C1 F6 F4; do
+            lower=$(echo "$flag" | tr '[:upper:]' '[:lower:]')
+            value=$(jq -r --arg f "$flag" '.flags[]|select(.id==$f).value' manifest.json)
+            echo "TF_VAR_marker_${lower}=${value}" >> "$GITHUB_ENV"
+          done
+
+      - name: terraform apply
+        env:
+          STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+        run: |
+          set -euo pipefail
+          terraform -chdir=infra/hosting init -input=false \
+            -backend-config="bucket=$STATE_BUCKET"
+          terraform -chdir=infra/hosting apply -input=false -auto-approve
+          url=$(terraform -chdir=infra/hosting output -raw service_url)
+          echo "site: $url" >> "$GITHUB_STEP_SUMMARY"
+
+      # always(): a failed apply must not leave every flag value sitting on a
+      # runner whose workspace outlives the step.
+      - name: Remove the manifest from the runner
+        if: always()
+        run: rm -f manifest.json estate.json

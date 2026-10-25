@@ -1,0 +1,59 @@
+rules_version = '2';
+
+// Document-level authorisation for F5 and F7b. Spike 0.3 established that the
+// same `team` claim driving IAM attribute mapping is available here as
+// `request.auth.token.team`, from one token and two enforcement systems.
+//
+// These rules govern the L3 path only, and not because L3 asks for them
+// specially: Firestore's server SDKs authenticate as a service and are not
+// subject to Security Rules at all. L1 and L2 use a server client and bypass
+// every line below. L3 goes through the REST API with the caller's own token,
+// which is a different client path from every other tool in the lab.
+//
+// The failure mode that follows is silent. A tool handed an admin Firestore
+// client keeps returning correct-looking data while the entire L3 control is
+// gone. Phase 2 asserts a denial, paired with a positive case in the same run
+// — spike 0.3 finding 3 saw rules propagation deny *everything* ten seconds
+// after publication, so a lone denial is not evidence of anything.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // F5 — employee records, owned by a team.
+    match /employees/{employee} {
+      allow read: if request.auth != null
+                  && request.auth.token.team == resource.data.owner_team;
+
+      // Personas never mutate employee records through this path, regardless
+      // of team. Provisioning is a capability-scoped write action instead,
+      // which is what F6 tests.
+      allow write: if false;
+    }
+
+    // F7 — per-persona agent memory (schemas.md §7).
+    //
+    // Readable only by the persona that wrote it, at every level. F7b's
+    // containment claim rests on this rule rather than on the model declining
+    // to be steered: a poisoned memory may well change the agent's behaviour
+    // (F7a is predicted defeated even at L3), but the behaviour it produces
+    // cannot reach another persona's records.
+    match /agent_memory/{record} {
+      allow read: if request.auth != null
+                  && request.auth.uid == resource.data.persona_sub;
+
+      allow create: if request.auth != null
+                    && request.auth.uid == request.resource.data.persona_sub;
+
+      // Memory is append-only. An agent that can rewrite an existing record
+      // can launder a planted directive into one that looks self-authored,
+      // which would make F7a and F7b indistinguishable in the transcript.
+      allow update, delete: if false;
+    }
+
+    // Deny by default. Any collection added later is closed until a rule is
+    // written for it deliberately, rather than open until someone notices.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

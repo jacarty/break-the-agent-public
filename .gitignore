@@ -1,0 +1,226 @@
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE specific files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Secrets and env files
+.env
+.env.local
+.env.development
+.env.production
+.secrets
+*.pem
+*.key
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pipenv
+#__Pipfile.lock
+
+# PEP 582
+__pypackages__/
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.venv
+.venv*
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# Project specific
+config.ini
+secrets.json
+
+# ─────────────────────────────────────────────────────────────────────────────
+# break-the-agent
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Fixture manifest — contains live flag values (schemas.md §3, SEC-7).
+# Never committed. Lives in Secret Manager or the state bucket.
+fixture-manifest*.json
+**/fixture-manifest*.json
+.fixtures/
+
+# Raw, unredacted transcripts (VER-6). Only redacted copies are ever committed.
+
+evidence/raw/
+**/transcripts/raw/
+
+# Terraform. Note .terraform.lock.hcl IS committed — do not add it here.
+.terraform/
+# Written by the operator during bootstrap step 2 from backend.tf.migrate.
+# Committing it would break step 1 for the next deployer: Terraform would try
+# to read a state bucket that does not exist yet.
+infra/bootstrap/backend.tf
+*.tfstate
+*.tfstate.*
+*.tfvars
+# Saved plan files. A plan embeds a full state snapshot, so it carries whatever
+# the state carries. `-out=tfplan` is the normal way to apply what was reviewed,
+# which means these are produced routinely rather than by accident.
+tfplan
+*.tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Spike scratch output (build-plan §1: spikes are deleted, findings retained)
+spikes/**/out/
+
+# Git worktrees created by /create_worktree
+.trees/
+
+# Local Claude Code overrides (settings.json itself IS committed)
+.claude/settings.local.json
+.claude/agent-memory/
+
+# Logs
+logs/
+*.log
+
+# Temporary / working files
+tmp/
+temp/
+
+# The local lab configuration for scripts/lab.sh. Deployment values and two
+# secrets; never committed (POR-6, POR-6c).
+.env.lab
+
+# Run artefacts. Redacted transcripts and audit records land here per turn
+# (TD-34); raw ones stay out of git regardless (VER-6). Nothing under runs/ is
+# a reference run until one is produced under the registered repeats, and an
+# untracked scratch run committed by accident reads as evidence.
+evidence/runs/*
+!evidence/runs/R-001.jsonl
+!evidence/runs/R-002-L2.jsonl
+!evidence/runs/R-003-L3.jsonl
+
+# Local deployment inventories identify real principals and cloud resources.
+evidence/teardown/*.json

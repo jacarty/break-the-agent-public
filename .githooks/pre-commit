@@ -1,0 +1,336 @@
+#!/bin/sh
+#
+# Pre-commit hook: flag-value detection + secrets detection + large file check
+# Runs on every commit to catch flag values, secrets and oversized files before
+# they enter history.
+#
+# Install: ./.githooks/setup-hooks.sh
+# Or set hooks path: git config core.hooksPath .githooks
+#
+# ── Why this hook matters more here than in a normal repo ────────────────────
+# SEC-7: flag payloads are credential-shaped by design and will trip secret
+# scanning. schemas.md §3: the fixture manifest holds live flag values and is
+# never committed. VER-6: only redacted transcripts are ever published.
+# This hook is the local enforcement of all three.
+
+set -e
+
+# Colours for output
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+NC='\033[0m' # No colour
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo ".")
+ALLOWLIST="$REPO_ROOT/.githooks/secret-scan-allowlist"
+
+# Get staged files (added or modified), excluding deleted files
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM 2>/dev/null)
+
+# Returns 0 if the path matches a glob in the allowlist.
+# The allowlist applies ONLY to the generic secret scanners below. Flag values
+# and the fixture manifest are never allowlistable — see SEC-7.
+is_allowlisted() {
+    [ -f "$ALLOWLIST" ] || return 1
+    while IFS= read -r pattern; do
+        case "$pattern" in
+            ''|'#'*) continue ;;
+        esac
+        # shellcheck disable=SC2254
+        case "$1" in
+            $pattern) return 0 ;;
+        esac
+    done < "$ALLOWLIST"
+    return 1
+}
+
+# ============================================================================
+# FLAG VALUES AND FIXTURE MANIFEST  (SEC-7, schemas.md §3, VER-6)
+# ============================================================================
+# Not allowlistable. Not overridable by config. If you are committing a real
+# flag value, the correct action is always to remove it, never to bypass.
+
+echo "🔍 Checking for flag values and fixture manifests..."
+
+FLAGS_FOUND=0
+
+for file in $STAGED_FILES; do
+    [ -f "$file" ] || continue
+
+    # The fixture manifest never enters the repository, whatever it contains.
+    case "$(basename "$file")" in
+        fixture-manifest*.json)
+            echo "${RED}✗ Fixture manifest staged: $file${NC}" >&2
+            echo "  This file holds live flag values (schemas.md §3). It belongs in" >&2
+            echo "  Secret Manager or the state bucket, never in git." >&2
+            FLAGS_FOUND=1
+            ;;
+    esac
+
+    if file "$file" 2>/dev/null | grep -q "binary"; then
+        continue
+    fi
+
+    STAGED_CONTENT=$(git show ":$file" 2>/dev/null) || continue
+
+    # A planted flag value: BTA{ followed by real value characters.
+    # The literal placeholder BTA{...} used throughout docs/ does not match,
+    # because '.' is not in the character class.
+    if echo "$STAGED_CONTENT" | grep -nE 'BTA\{[A-Za-z0-9_-]{6,}\}' > /dev/null 2>&1; then
+        echo "${RED}✗ Flag value found in: $file${NC}" >&2
+        FLAGS_FOUND=1
+    fi
+done
+
+if [ "$FLAGS_FOUND" -eq 1 ]; then
+    echo "" >&2
+    echo "${RED}✗ Flag material detected in staged files. Commit blocked.${NC}" >&2
+    echo "" >&2
+    echo "Flag values must never be committed. If this came from a transcript," >&2
+    echo "commit the redacted copy instead (VER-6). Do not use --no-verify here:" >&2
+    echo "once a value is in history, the estate needs reseeding." >&2
+    exit 1
+fi
+
+echo "✓ No flag material detected"
+
+# ============================================================================
+# SECRETS DETECTION
+# ============================================================================
+# Scans staged file contents for common secret patterns.
+# This is a lightweight local check — not a replacement for server-side scanning.
+# Push protection stays on regardless (SEC-7).
+
+echo "🔍 Checking for secrets in staged files..."
+
+SECRETS_FOUND=0
+
+if [ -n "$STAGED_FILES" ]; then
+    for file in $STAGED_FILES; do
+        # Skip binary files
+        if file "$file" 2>/dev/null | grep -q "binary"; then
+            continue
+        fi
+
+        # Skip files that don't exist (edge case with renames)
+        if [ ! -f "$file" ]; then
+            continue
+        fi
+
+        # Skip files the allowlist covers. Intended for credential-shaped
+        # synthetic fixtures (SEC-7), which are the whole point of the estate.
+        if is_allowlisted "$file"; then
+            continue
+        fi
+
+        # Get the staged content (not working directory content)
+        STAGED_CONTENT=$(git show ":$file" 2>/dev/null) || continue
+
+        # AWS Access Key ID (starts with AKIA)
+        if echo "$STAGED_CONTENT" | grep -nE 'AKIA[0-9A-Z]{16}' > /dev/null 2>&1; then
+            echo "${RED}✗ Potential AWS Access Key found in: $file${NC}" >&2
+            SECRETS_FOUND=1
+        fi
+
+        # AWS Secret Access Key (40 char base64-ish string after common key names)
+        if echo "$STAGED_CONTENT" | grep -nE '(aws_secret_access_key|AWS_SECRET_ACCESS_KEY|secret_access_key)\s*[=:]\s*[A-Za-z0-9/+=]{40}' > /dev/null 2>&1; then
+            echo "${RED}✗ Potential AWS Secret Key found in: $file${NC}" >&2
+            SECRETS_FOUND=1
+        fi
+
+        # GCP service account key material (SEC-5: none should exist anywhere)
+        if echo "$STAGED_CONTENT" | grep -nE '"type"\s*:\s*"service_account"' > /dev/null 2>&1; then
+            echo "${RED}✗ GCP service account key found in: $file${NC}" >&2
+            echo "  SEC-5: no long-lived service account keys anywhere in this project." >&2
+            SECRETS_FOUND=1
+        fi
+
+        # Anthropic / OpenAI provider keys (SEC-9: Secret Manager only)
+        if echo "$STAGED_CONTENT" | grep -nE '(sk-ant-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9]{32,})' > /dev/null 2>&1; then
+            echo "${RED}✗ Potential provider API key found in: $file${NC}" >&2
+            SECRETS_FOUND=1
+        fi
+
+        # Generic API keys and tokens (common variable name patterns)
+        if echo "$STAGED_CONTENT" | grep -nEi '(api_key|apikey|api_secret|access_token|auth_token|secret_key|private_key|client_secret)\s*[=:]\s*["\x27][A-Za-z0-9_\-\.]{20,}["\x27]' > /dev/null 2>&1; then
+            echo "${RED}✗ Potential API key/token found in: $file${NC}" >&2
+            SECRETS_FOUND=1
+        fi
+
+        # GitHub tokens (ghp_, gho_, ghu_, ghs_, ghr_)
+        if echo "$STAGED_CONTENT" | grep -nE 'gh[pousr]_[A-Za-z0-9_]{36,}' > /dev/null 2>&1; then
+            echo "${RED}✗ Potential GitHub token found in: $file${NC}" >&2
+            SECRETS_FOUND=1
+        fi
+
+        # Slack tokens
+        if echo "$STAGED_CONTENT" | grep -nE 'xox[baprs]-[0-9a-zA-Z\-]{10,}' > /dev/null 2>&1; then
+            echo "${RED}✗ Potential Slack token found in: $file${NC}" >&2
+            SECRETS_FOUND=1
+        fi
+
+        # Private keys
+        if echo "$STAGED_CONTENT" | grep -nE '\-\-\-\-\-BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY\-\-\-\-\-' > /dev/null 2>&1; then
+            echo "${RED}✗ Private key found in: $file${NC}" >&2
+            SECRETS_FOUND=1
+        fi
+
+        # Generic high-entropy secrets (password/secret assignments with quoted values)
+        if echo "$STAGED_CONTENT" | grep -nEi '(password|passwd|pwd)\s*[=:]\s*["\x27][^"\x27]{8,}["\x27]' > /dev/null 2>&1; then
+            # Exclude common false positives
+            if ! echo "$file" | grep -qE '\.(md|txt|example|sample|template)$'; then
+                echo "${YELLOW}⚠ Potential hardcoded password in: $file${NC}" >&2
+                SECRETS_FOUND=1
+            fi
+        fi
+
+        # Connection strings with credentials
+        if echo "$STAGED_CONTENT" | grep -nEi '(mongodb|postgres|mysql|redis|amqp|mssql)://[^:]+:[^@]+@' > /dev/null 2>&1; then
+            echo "${RED}✗ Potential connection string with credentials in: $file${NC}" >&2
+            SECRETS_FOUND=1
+        fi
+    done
+fi
+
+if [ "$SECRETS_FOUND" -eq 1 ]; then
+    echo "" >&2
+    echo "${RED}✗ Secrets detected in staged files. Commit blocked.${NC}" >&2
+    echo "" >&2
+    echo "If these are false positives, you can:" >&2
+    echo "  1. Move the values to environment variables or Secret Manager" >&2
+    echo "  2. Add a narrow path glob to .githooks/secret-scan-allowlist (SEC-7)" >&2
+    echo "  3. Skip this check with: git commit --no-verify" >&2
+    exit 1
+fi
+
+echo "✓ No secrets detected"
+
+# ============================================================================
+# LARGE FILE CHECK
+# ============================================================================
+# Prevents files over the threshold from being committed.
+# Default: 5MB. Override with: git config hooks.maxfilesize <bytes>
+
+MAX_FILE_SIZE=$(git config --get hooks.maxfilesize 2>/dev/null || echo 5242880)
+MAX_FILE_SIZE_MB=$((MAX_FILE_SIZE / 1048576))
+
+echo "🔍 Checking for files larger than ${MAX_FILE_SIZE_MB}MB..."
+
+LARGE_FILES_FOUND=0
+
+for file in $STAGED_FILES; do
+    # Skip deleted files
+    if [ ! -f "$file" ]; then
+        continue
+    fi
+
+    FILE_SIZE=$(wc -c < "$file" 2>/dev/null | tr -d ' ')
+
+    if [ "$FILE_SIZE" -gt "$MAX_FILE_SIZE" ] 2>/dev/null; then
+        FILE_SIZE_MB=$(echo "scale=1; $FILE_SIZE / 1048576" | bc 2>/dev/null || echo "${FILE_SIZE}B")
+        echo "${RED}✗ $file (${FILE_SIZE_MB}MB) exceeds ${MAX_FILE_SIZE_MB}MB limit${NC}" >&2
+        LARGE_FILES_FOUND=1
+    fi
+done
+
+if [ "$LARGE_FILES_FOUND" -eq 1 ]; then
+    echo "" >&2
+    echo "${RED}✗ Large files detected. Commit blocked.${NC}" >&2
+    echo "" >&2
+    echo "Add large files to .gitignore or use Git LFS." >&2
+    echo "Override threshold: git config hooks.maxfilesize <bytes>" >&2
+    echo "Skip this check with: git commit --no-verify" >&2
+    exit 1
+fi
+
+echo "✓ No oversized files"
+
+# ============================================================================
+# LINT
+# ============================================================================
+# Deliberately forgiving about absence and strict about failure.
+#
+# Every check below no-ops when there is nothing of that type staged, or when
+# the tool is not installed. This matters more than it looks: the flag-value
+# block above lives in the same hook, and a hook that fires spuriously trains
+# the habit of reaching for --no-verify. The lint checks must never be the
+# reason someone learns to skip this file.
+#
+# terraform validate is deliberately absent — it needs `init` and a backend,
+# so it belongs in CI, not in a pre-commit hook.
+
+LINT_FAILED=0
+
+# ── Python: ruff ─────────────────────────────────────────────────────────────
+STAGED_PY=$(echo "$STAGED_FILES" | grep -E '\.py$' || true)
+
+if [ -n "$STAGED_PY" ]; then
+    RUFF=""
+    if [ -x "$REPO_ROOT/.venv/bin/ruff" ]; then
+        RUFF="$REPO_ROOT/.venv/bin/ruff"
+    elif command -v ruff > /dev/null 2>&1; then
+        RUFF="ruff"
+    fi
+
+    if [ -z "$RUFF" ]; then
+        echo "${YELLOW}⚠ ruff not found — skipping Python lint${NC}"
+        echo "  Install with: uv sync"
+    else
+        echo "🔍 Linting staged Python files..."
+
+        # --force-exclude makes ruff honour the project's exclude rules even
+        # for files passed explicitly, which is how hooks pass them.
+        # shellcheck disable=SC2086
+        if ! $RUFF check --force-exclude $STAGED_PY; then
+            LINT_FAILED=1
+        fi
+
+        # shellcheck disable=SC2086
+        if ! $RUFF format --check --force-exclude $STAGED_PY; then
+            echo "${YELLOW}  Fix with: ruff format <files>${NC}" >&2
+            LINT_FAILED=1
+        fi
+
+        [ "$LINT_FAILED" -eq 0 ] && echo "✓ Python lint clean"
+    fi
+fi
+
+# ── Terraform: fmt ───────────────────────────────────────────────────────────
+STAGED_TF=$(echo "$STAGED_FILES" | grep -E '\.(tf|tfvars)$' || true)
+
+if [ -n "$STAGED_TF" ]; then
+    if ! command -v terraform > /dev/null 2>&1; then
+        echo "${YELLOW}⚠ terraform not found — skipping fmt check${NC}"
+    else
+        echo "🔍 Checking Terraform formatting..."
+
+        TF_DIRS=$(echo "$STAGED_TF" | xargs -n1 dirname 2>/dev/null | sort -u)
+        TF_FAILED=0
+
+        for dir in $TF_DIRS; do
+            [ -d "$dir" ] || continue
+            if ! terraform fmt -check -diff "$dir" > /dev/null 2>&1; then
+                echo "${RED}✗ Unformatted Terraform in: $dir${NC}" >&2
+                terraform fmt -check -diff "$dir" >&2 2>/dev/null || true
+                TF_FAILED=1
+            fi
+        done
+
+        if [ "$TF_FAILED" -eq 1 ]; then
+            echo "${YELLOW}  Fix with: terraform fmt -recursive${NC}" >&2
+            LINT_FAILED=1
+        else
+            echo "✓ Terraform formatting clean"
+        fi
+    fi
+fi
+
+if [ "$LINT_FAILED" -eq 1 ]; then
+    echo "" >&2
+    echo "${RED}✗ Lint failures. Commit blocked.${NC}" >&2
+    echo "" >&2
+    echo "Fix the issues above, or skip with: git commit --no-verify" >&2
+    echo "(Note: --no-verify also skips the flag and secret checks. Prefer fixing.)" >&2
+    exit 1
+fi
+
+exit 0

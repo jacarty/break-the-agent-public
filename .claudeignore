@@ -1,0 +1,63 @@
+# Files and directories Claude should not read.
+# Edit this list to match your project — the entries below are sensible
+# defaults for common languages and infrastructure setups.
+
+# Environment files
+.env
+.env.local
+.env.*
+*.env
+
+# Private keys and credentials
+*.key
+*.pem
+*.p12
+*.pfx
+id_rsa
+id_rsa.pub
+*.secret
+*.password
+
+# Common secret directories
+/private/
+/secrets/
+**/secrets/
+**/credentials/
+.aws/credentials
+.aws/config
+
+# Cloud / IaC state and variables (may contain secrets)
+terraform.tfvars
+*.tfvars
+*.tfvars.json
+*.tfstate
+*.tfstate.*
+backend.conf
+backend-*.conf
+
+# Large generated / build outputs
+*.log
+*.sqlite
+*.db
+/dist/
+/build/
+node_modules/
+
+# ─────────────────────────────────────────────────────────────────────────────
+# break-the-agent
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Live flag values. Only the verifier reads these (schemas.md §3) — nothing
+# else, and that includes Claude. Reading them into context risks them
+# reaching a transcript or a commit.
+fixture-manifest*.json
+**/fixture-manifest*.json
+.fixtures/
+
+# Raw, unredacted transcripts (VER-6). Read the redacted copies instead.
+evidence/raw/
+**/transcripts/raw/
+
+# Attacker-supplied text, stored for analysis and explicitly never to be
+# re-rendered into any model context (schemas.md §6). Treat as data.
+evidence/audit/

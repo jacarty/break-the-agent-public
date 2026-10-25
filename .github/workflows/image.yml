@@ -1,0 +1,105 @@
+# Builds the arena site's container image and pushes it to the registry
+# infra/bootstrap creates.
+#
+# Separate from ci.yml on purpose. The gates run on every pull request and this
+# does not: pushing an image costs registry storage against a capped budget
+# (SEC-2), and an image built from an unmerged branch is not a thing anything
+# should be able to deploy by accident.
+#
+# The output is a **digest**, not a tag. `infra/hosting/variables.tf` refuses
+# anything else, because SC-6 commits the reference run to being reproducible
+# and a tag can be moved after the fact.
+
+name: image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Extra tag to apply alongside the commit SHA
+        type: string
+        default: ""
+  # Callable, so `ci.yml` can build and deploy in one dispatch rather than
+  # having an operator copy a digest between two workflows by hand. That copy
+  # is the step where the wrong commit gets deployed: a build from the wrong
+  # ref succeeds, prints a valid digest, and reports nothing wrong. Passing it
+  # as a job output removes the transcription entirely.
+  workflow_call:
+    inputs:
+      tag:
+        description: Extra tag to apply alongside the commit SHA
+        type: string
+        default: ""
+    outputs:
+      image:
+        description: The digest-pinned reference, for infra/hosting's var.image
+        value: ${{ jobs.build.outputs.image }}
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  # Required by google-github-actions/auth. CI holds no long-lived cloud
+  # credential (SEC-6) — this is the OIDC token the WIF exchange consumes.
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment: image
+    outputs:
+      image: ${{ steps.push.outputs.image }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_CI_DEPLOY_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: configure docker for artifact registry
+        run: gcloud auth configure-docker "${{ vars.GCP_REGION }}-docker.pkg.dev" --quiet
+
+      - name: build and push
+        id: push
+        env:
+          REPOSITORY: ${{ vars.GCP_REGISTRY_REPOSITORY }}
+          EXTRA_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          test -n "$REPOSITORY" || {
+            echo "GCP_REGISTRY_REPOSITORY is unset. It is the registry_repository output of infra/bootstrap." >&2
+            exit 1
+          }
+
+          docker build --tag "$REPOSITORY/site:${GITHUB_SHA}" .
+          if [ -n "$EXTRA_TAG" ]; then
+            docker tag "$REPOSITORY/site:${GITHUB_SHA}" "$REPOSITORY/site:${EXTRA_TAG}"
+          fi
+
+          docker push --all-tags "$REPOSITORY/site"
+
+          # The digest is what infra/hosting takes. Read it back from the
+          # registry rather than from the local daemon, so the recorded value
+          # is what the registry actually holds.
+          digest="$(gcloud artifacts docker images describe \
+            "$REPOSITORY/site:${GITHUB_SHA}" --format='value(image_summary.digest)')"
+          echo "image=$REPOSITORY/site@$digest" >> "$GITHUB_OUTPUT"
+
+      - name: report
+        run: |
+          {
+            echo "### Image built"
+            echo
+            echo '```'
+            echo "${{ steps.push.outputs.image }}"
+            echo '```'
+            echo
+            echo "Pass this to \`infra/hosting\` as \`TF_VAR_image\`."
+          } >> "$GITHUB_STEP_SUMMARY"

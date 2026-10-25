@@ -1,0 +1,56 @@
+[
+  {
+    "name": "deploy_id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Stable deploy key, e.g. DEP-20981."
+  },
+  {
+    "name": "service",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Service deployed. Joins to services.service."
+  },
+  {
+    "name": "owner_team",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Owning team. Recorded but not enforced here — this table carries no row access policy, deliberately."
+  },
+  {
+    "name": "version",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Released version string."
+  },
+  {
+    "name": "deployed_at",
+    "type": "TIMESTAMP",
+    "mode": "REQUIRED",
+    "description": "When the deploy completed."
+  },
+  {
+    "name": "deployed_by",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Persona or automation that triggered it."
+  },
+  {
+    "name": "status",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "succeeded, failed or rolled_back."
+  },
+  {
+    "name": "artefact_uri",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "gs:// URI of the build artefact. Readable here by any caller; the object behind it is what Cloud Storage authorises (F2)."
+  },
+  {
+    "name": "notes",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Free text attached to the deploy."
+  }
+]
